@@ -43,13 +43,14 @@ import numpy as np                               # Arrays para set_offsets del s
 
 # Número de pasos que un semáforo permanece en verde antes de pasar a amarillo.
 # Debe ser >= tiempo de cruce: la intersección mide 0.30 y la velocidad es 0.02,
-# por lo que cruzar tarda 0.30 / 0.02 = 15 pasos. Con 20 pasos de verde hay
-# margen para que varios carros en cola alcancen a cruzar completamente.
-CICLO_VERDE = 20
+# por lo que cruzar tarda 0.30 / 0.02 = 15 pasos. Con 35 pasos de verde hay
+# margen amplio para que todos los carros en cola crucen cómodamente, y el
+# semáforo se percibe visualmente como lento y realista.
+CICLO_VERDE = 40
 
 # Número de pasos en amarillo (advertencia: los carros frenan y se detienen).
-# 3 pasos da tiempo visual suficiente para notar el cambio de color.
-CICLO_AMARILLO = 3
+# 5 pasos da tiempo visual suficiente para notar el cambio de color claramente.
+CICLO_AMARILLO = 5
 
 # Número de pasos en rojo (el eje contrario tiene verde durante este tiempo).
 # Simétrico con CICLO_VERDE para que ambos ejes reciban el mismo tiempo de paso.
@@ -71,20 +72,19 @@ VELOCIDAD_CARRO = 0.02
 DISTANCIA_MIN = 0.10
 
 # Posición (en coordenadas [0, 1]) donde los carros frenan al encontrar semáforo
-# en rojo o amarillo. Debe ser ESTRICTAMENTE MENOR que INTER_MIN (0.35) para que
+# en rojo o amarillo. Debe ser ESTRICTAMENTE MENOR que INTER_MIN (0.40) para que
 # los carros se detengan ANTES de entrar a la intersección y no se acumulen dentro.
 STOP_LINE = 0.33
 
 # Cada cuántos pasos de simulación aparece un nuevo carro en cada extremo.
 # Con VELOCIDAD=0.02, un carro tarda 50 pasos en cruzar la pantalla completa.
-# Con intervalo 12, entran ~4 carros por carril antes de que el primero salga,
-# lo que genera una cola visible pero sin saturar el carril ni provocar solapamientos.
-SPAWN_INTERVALO = 12
+# Con intervalo 20, los carros se generan lentamente y nunca superan el límite
+# de 4 por carril, dando una sensación de tráfico fluido y no saturado.
+SPAWN_INTERVALO = 20
 
-# Máximo de carros activos en total. Con 4 direcciones son ~4-5 por carril como máximo,
-# suficiente para ver la cola sin que los carriles se saturen visualmente.
-# Se usa 20 en lugar de 16 para no cortar el spawn cuando un carril tiene 5 momentáneamente.
-MAX_CARROS = 20
+# Máximo de carros por carril (por dirección). Se controla individualmente en
+# _generar_carro() para que ningún color supere este límite en ningún momento.
+MAX_CARROS_POR_CARRIL = 3
 
 # ── Geometría de la intersección ─────────────────────────────────────────────
 
@@ -243,6 +243,16 @@ class CarroAgent(Agent):
         self.estado = "MOVIENDO"                   # Estado inicial: en movimiento
         self.activo = True                         # True mientras está en la pantalla
 
+        # Estado del semáforo en el paso anterior. Se usa para detectar la
+        # transición rojo/amarillo → verde y aplicar el arranque escalonado.
+        self._semaforo_estado_anterior = None
+
+        # Pasos que aún debe esperar antes de arrancar (arranque escalonado).
+        # Cuando el semáforo cambia a verde, cada carro en la cola recibe un
+        # retraso proporcional a su posición en la fila: el primero arranca
+        # inmediatamente, el segundo espera 2 pasos, el tercero 4, etc.
+        self._pasos_espera_arranque = 0
+
     def _obtener_semaforo(self) -> Semaforo:
         """
         Retorna el semáforo que controla el eje de este carro.
@@ -291,9 +301,13 @@ class CarroAgent(Agent):
 
         Prioridades (en orden):
         1. Si ya salió de la pantalla (posicion > 1.0) → se desactiva
-        2. Si el semáforo está en rojo/amarillo Y el carro llegó a STOP_LINE → espera
-        3. Si hay un carro adelante dentro de DISTANCIA_MIN → espera (cola)
-        4. En cualquier otro caso → avanza VELOCIDAD_CARRO
+        2. Si el semáforo acaba de cambiar a verde → calcular retraso de arranque
+           escalonado según posición en la cola (el primero arranca ya, los de
+           atrás esperan 2 pasos por cada carro que tienen delante)
+        3. Si aún está en espera de arranque escalonado → descontar un paso
+        4. Si el semáforo está en rojo/amarillo Y el carro llegó a STOP_LINE → espera
+        5. Si hay un carro adelante dentro de DISTANCIA_MIN → espera (cola)
+        6. En cualquier otro caso → avanza VELOCIDAD_CARRO
         """
 
         # ── Caso 1: el carro ya salió de la pantalla ──────────────────────────
@@ -302,12 +316,55 @@ class CarroAgent(Agent):
             self.estado = "FUERA"
             return                 # No hay más acciones que tomar
 
-        # ── Caso 2: semáforo en rojo/amarillo y carro en la línea de stop ─────
+        # ── Obtener estado actual del semáforo ────────────────────────────────
+        semaforo = self._obtener_semaforo()
+        estado_actual = semaforo.estado
+
+        # ── Caso 2: el semáforo acaba de cambiar a VERDE ──────────────────────
+        # Detectamos la transición comparando con el estado del paso anterior.
+        # Solo aplicamos el retraso si el carro está en la zona de cola
+        # (entre STOP_LINE e INTER_MIN), es decir, estaba detenido esperando.
+        recien_cambio_a_verde = (
+            estado_actual == VERDE
+            and self._semaforo_estado_anterior != VERDE
+            and self.posicion >= STOP_LINE
+            and self.posicion <= INTER_MIN
+        )
+
+        if recien_cambio_a_verde:
+            # Contamos cuántos carros del mismo carril están DELANTE de este
+            # y también en la zona de cola (posicion entre STOP_LINE e INTER_MIN).
+            # El resultado es la posición en la fila (0 = primero, 1 = segundo, etc.)
+            carros_delante_en_cola = sum(
+                1 for a in self.model.agents
+                if (
+                    isinstance(a, CarroAgent)
+                    and a is not self
+                    and a.activo
+                    and a.direccion == self.direccion
+                    and a.posicion > self.posicion      # Está delante
+                    and a.posicion <= INTER_MIN         # También en la cola
+                )
+            )
+            # Retraso: 2 pasos por cada carro que tiene delante en la cola.
+            # El primero (0 carros delante) arranca de inmediato (retraso = 0).
+            # El segundo espera 2 pasos, el tercero 4, etc.
+            self._pasos_espera_arranque = carros_delante_en_cola * 2
+
+        # Guardamos el estado actual para detectar la transición en el siguiente paso
+        self._semaforo_estado_anterior = estado_actual
+
+        # ── Caso 3: aún en espera de arranque escalonado ──────────────────────
+        if self._pasos_espera_arranque > 0:
+            self._pasos_espera_arranque -= 1   # Descontamos un paso de espera
+            self.estado = "ESPERANDO"
+            return                             # No avanza todavía
+
+        # ── Caso 4: semáforo en rojo/amarillo y carro en la línea de stop ─────
         # La condición clave: el carro debe estar entre STOP_LINE y INTER_MIN.
         # Esto garantiza que se detenga ANTES de entrar a la intersección.
         # Si ya pasó INTER_MIN (entró a cruzar con verde) no se le detiene,
         # pues interrumpirlo a mitad del cruce causaría acumulación en el centro.
-        semaforo = self._obtener_semaforo()
         semaforo_bloqueante = (
             not semaforo.permite_avanzar()           # El semáforo NO está en verde
             and self.posicion >= STOP_LINE           # El carro llegó a la línea de stop
@@ -318,12 +375,12 @@ class CarroAgent(Agent):
             self.estado = "ESPERANDO"   # El carro espera en la línea de stop
             return                      # No avanza en este paso
 
-        # ── Caso 3: hay un carro adelante muy cerca (respeto de cola) ─────────
+        # ── Caso 5: hay un carro adelante muy cerca (respeto de cola) ─────────
         if self._hay_carro_adelante():
             self.estado = "ESPERANDO"   # El carro espera detrás del de adelante
             return                      # No avanza en este paso
 
-        # ── Caso 4: puede avanzar libremente ──────────────────────────────────
+        # ── Caso 6: puede avanzar libremente ──────────────────────────────────
         self.posicion += VELOCIDAD_CARRO    # Mueve el carro hacia adelante
         self.estado = "MOVIENDO"            # El carro está en movimiento
 
@@ -363,6 +420,15 @@ class TraficoModel(Model):
         # Para que estén realmente en oposición, iniciamos el vertical con
         # un contador ya avanzado (equivalente a que lleva CICLO_VERDE pasos en rojo)
         self.semaforo_vertical = Semaforo("VERTICAL", ROJO)
+
+        # ── Offsets de spawn por dirección ────────────────────────────────────
+        # Cada dirección recibe un desplazamiento aleatorio dentro del intervalo
+        # de spawn. Así los carros de cada carril aparecen en pasos distintos
+        # en lugar de todos al mismo tiempo, evitando colisiones iniciales.
+        self._spawn_offsets = {
+            d: random.randint(0, SPAWN_INTERVALO - 1)
+            for d in ("NORTE", "SUR", "ESTE", "OESTE")
+        }
 
         # ── DataCollector ─────────────────────────────────────────────────────
         # Registra en cada paso cuántos carros activos hay por dirección
@@ -413,11 +479,23 @@ class TraficoModel(Model):
     def _generar_carro(self, direccion: str):
         """
         Intenta crear un nuevo carro en el extremo de entrada del carril indicado.
-        No lo crea si el primer tramo del carril ya está ocupado (evita solapamiento).
+        No lo crea si:
+          - Ya hay un carro cerca del punto de entrada (evita solapamiento al nacer), o
+          - El carril ya tiene MAX_CARROS_POR_CARRIL carros activos (evita saturación).
 
         Parámetros:
             direccion (str): dirección del nuevo carro
         """
+        # Contamos cuántos carros activos hay ya en este carril
+        carros_en_carril = sum(
+            1 for a in self.agents
+            if isinstance(a, CarroAgent) and a.activo and a.direccion == direccion
+        )
+
+        # Si el carril ya alcanzó el límite por dirección, no generamos más
+        if carros_en_carril >= MAX_CARROS_POR_CARRIL:
+            return
+
         # Verificamos que no haya un carro muy cerca del punto de entrada (posicion ≈ 0.0)
         hay_carro_en_entrada = any(
             a for a in self.agents
@@ -457,13 +535,17 @@ class TraficoModel(Model):
         self.semaforo_vertical.step()
 
         # ── 3. Generamos nuevos carros si corresponde ─────────────────────────
-        # Solo generamos si no hemos alcanzado el máximo y toca según el intervalo
-        if (
-            self.paso_actual % SPAWN_INTERVALO == 0
-            and self._contar_carros_activos() < MAX_CARROS
-        ):
-            for direccion in ("NORTE", "SUR", "ESTE", "OESTE"):
-                self._generar_carro(direccion)   # Un carro nuevo por dirección
+        # Cada dirección tiene su propio offset aleatorio (_spawn_offsets) para
+        # que los carros de distintos carriles aparezcan en pasos diferentes.
+        # Esto evita que al inicio todos los carriles generen un carro en el
+        # mismo frame. El límite por carril se controla dentro de _generar_carro().
+        for direccion in ("NORTE", "SUR", "ESTE", "OESTE"):
+            # El offset desplaza el ciclo de spawn de esta dirección de forma
+            # exclusiva: (paso + offset) % SPAWN_INTERVALO == 0 ocurre una vez
+            # cada SPAWN_INTERVALO pasos, pero en un paso distinto para cada carril.
+            offset = self._spawn_offsets[direccion]
+            if (self.paso_actual + offset) % SPAWN_INTERVALO == 0:
+                self._generar_carro(direccion)   # Un carro nuevo en este carril
 
         # ── 4. Ejecutamos cada carro en orden (adelante → atrás) ──────────────
         # Ordenar del más adelantado (posicion mayor) al más atrasado garantiza
@@ -753,7 +835,7 @@ def animar_simulacion(num_pasos: int = 60, intervalo_ms: int = 120):
     # Configuración del eje de barras
     ax_barras.set_xticks(x_pos)
     ax_barras.set_xticklabels(nombres_dir, fontsize=11)
-    ax_barras.set_ylim(0, MAX_CARROS // 4 + 2)     # Máximo por dirección
+    ax_barras.set_ylim(0, MAX_CARROS_POR_CARRIL + 2)   # Máximo por dirección + margen
     ax_barras.set_ylabel("Carros activos", fontsize=11)
     ax_barras.set_title("Carros activos por dirección", fontsize=11, fontweight="bold")
     ax_barras.grid(True, axis="y", alpha=0.3, zorder=0)
@@ -974,7 +1056,7 @@ def imprimir_resumen(modelo: TraficoModel, num_pasos: int):
     print(f"  Ciclo verde           : {CICLO_VERDE} pasos")
     print(f"  Ciclo amarillo        : {CICLO_AMARILLO} pasos")
     print(f"  Intervalo de spawn    : cada {SPAWN_INTERVALO} pasos")
-    print(f"  Máximo de carros      : {MAX_CARROS}")
+    print(f"  Máx. carros por carril: {MAX_CARROS_POR_CARRIL}")
     print()
     print("  Estadísticas de carros activos por dirección:")
     print("  " + "-" * 52)
@@ -1007,7 +1089,7 @@ if __name__ == "__main__":
     print(f"  Intervalo       : {INTERVALO_MS} ms por frame")
     print(f"  Ciclo semáforo  : {CICLO_VERDE}v / {CICLO_AMARILLO}a / {CICLO_ROJO}r pasos")
     print(f"  Spawn cada      : {SPAWN_INTERVALO} pasos por dirección")
-    print(f"  Máx. carros     : {MAX_CARROS}")
+    print(f"  Máx. carros por carril: {MAX_CARROS_POR_CARRIL}")
     print("  Cierra la ventana para ver el resumen en consola.")
     print("=" * 58)
 
