@@ -632,7 +632,7 @@ if __name__ == "__main__":
     NUM_PASOS = 30
 
     # Número de estudiantes agentes
-    NUM_ESTUDIANTES = 50
+    NUM_ESTUDIANTES = 100
 
     print("\n" + "="*55)
     print("  SIMULACION DE MOVIMIENTO ESTUDIANTIL - ANIMACION")
